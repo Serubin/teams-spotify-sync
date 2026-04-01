@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.0.0"
+LABEL="net.serubin.teams-spotify-sync"
+PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/teams-spotify-sync"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# Defaults
+TEAMS_MONITOR_CMD="teams-monitor"
+MEETING_VOLUME=65
+DEFAULT_VOLUME=100
+
+# State
+was_in_meeting=false
+saved_volume=""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+}
+
+check_deps() {
+    command -v "$TEAMS_MONITOR_CMD" >/dev/null 2>&1 \
+        || die "teams-monitor not found. Install with: dotnet tool install -g svrooij.teams-monitor"
+    command -v jq >/dev/null 2>&1 \
+        || die "jq not found. Install with: brew install jq"
+}
+
+# ---------------------------------------------------------------------------
+# Spotify AppleScript helpers
+# ---------------------------------------------------------------------------
+
+spotify_is_running() {
+    osascript -e 'application "Spotify" is running' 2>/dev/null | grep -q "true"
+}
+
+spotify_player_state() {
+    osascript -e 'tell application "Spotify" to player state as string' 2>/dev/null
+}
+
+spotify_get_volume() {
+    osascript -e 'tell application "Spotify" to sound volume' 2>/dev/null
+}
+
+spotify_set_volume() {
+    local vol="$1"
+    osascript -e "tell application \"Spotify\" to set sound volume to $vol" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+process_line() {
+    local line="$1"
+
+    # Skip non-update lines
+    [[ "$line" == Update:* ]] || return 0
+
+    local json="${line#Update: }"
+    local is_in_meeting
+    is_in_meeting=$(echo "$json" | jq -r '.meetingState.isInMeeting' 2>/dev/null) || return 0
+
+    # Only act on state transitions
+    if [[ "$is_in_meeting" == "true" && "$was_in_meeting" == "false" ]]; then
+        was_in_meeting=true
+        log "Meeting started"
+
+        if spotify_is_running && [[ "$(spotify_player_state)" == "playing" ]]; then
+            saved_volume=$(spotify_get_volume)
+            spotify_set_volume "$MEETING_VOLUME"
+            log "Spotify volume: ${saved_volume:-?} -> $MEETING_VOLUME"
+        else
+            log "Spotify not playing, no volume change"
+        fi
+
+    elif [[ "$is_in_meeting" == "false" && "$was_in_meeting" == "true" ]]; then
+        was_in_meeting=false
+        log "Meeting ended"
+
+        local restore_vol="${saved_volume:-$DEFAULT_VOLUME}"
+        if spotify_is_running; then
+            spotify_set_volume "$restore_vol"
+            log "Spotify volume restored to $restore_vol"
+        fi
+        saved_volume=""
+    fi
+}
+
+cmd_run() {
+    check_deps
+    log "teams-spotify-sync v$VERSION starting (meeting_vol=$MEETING_VOLUME, default_vol=$DEFAULT_VOLUME)"
+
+    local backoff=5
+    while true; do
+        log "Starting $TEAMS_MONITOR_CMD..."
+        was_in_meeting=false
+        saved_volume=""
+
+        set +e
+        while IFS= read -r line; do
+            backoff=5  # reset on successful read
+            process_line "$line"
+        done < <("$TEAMS_MONITOR_CMD" 2>&1)
+        local exit_code=$?
+        set -e
+
+        log "$TEAMS_MONITOR_CMD exited ($exit_code), restarting in ${backoff}s..."
+        sleep "$backoff"
+        backoff=$((backoff * 2 > 60 ? 60 : backoff * 2))
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Setup & LaunchAgent management
+# ---------------------------------------------------------------------------
+
+install_deps() {
+    echo "Checking dependencies..."
+    echo ""
+
+    # jq
+    if command -v jq >/dev/null 2>&1; then
+        echo "  jq: $(jq --version) (installed)"
+    else
+        read -rp "  jq is not installed. Install via Homebrew? [Y/n]: " answer
+        if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
+            brew install jq
+        else
+            echo "  Skipping jq. You will need to install it manually."
+        fi
+    fi
+
+    # teams-monitor
+    if command -v "$TEAMS_MONITOR_CMD" >/dev/null 2>&1; then
+        echo "  teams-monitor: installed"
+    else
+        read -rp "  teams-monitor is not installed. Install via dotnet? [Y/n]: " answer
+        if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
+            if ! command -v dotnet >/dev/null 2>&1; then
+                echo "  dotnet not found. Install the .NET SDK first: https://dotnet.microsoft.com/download"
+            else
+                dotnet tool install -g svrooij.teams-monitor
+            fi
+        else
+            echo "  Skipping teams-monitor. You will need to install it manually."
+        fi
+    fi
+
+    echo ""
+}
+
+cmd_setup() {
+    echo "teams-spotify-sync setup"
+    echo "========================"
+    echo ""
+
+    install_deps
+
+    local mv="$MEETING_VOLUME"
+    local dv="$DEFAULT_VOLUME"
+
+    read -rp "Volume during meetings (0-100) [$mv]: " input
+    MEETING_VOLUME="${input:-$mv}"
+
+    read -rp "Default volume when not in meeting (0-100) [$dv]: " input
+    DEFAULT_VOLUME="${input:-$dv}"
+
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+# teams-spotify-sync configuration
+MEETING_VOLUME=$MEETING_VOLUME
+DEFAULT_VOLUME=$DEFAULT_VOLUME
+# TEAMS_MONITOR_CMD=teams-monitor
+EOF
+
+    echo ""
+    echo "Config saved to $CONFIG_FILE"
+    echo ""
+
+    read -rp "Install LaunchAgent to start on login? [Y/n]: " answer
+    if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
+        cmd_install
+    fi
+}
+
+cmd_install() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cmd_setup
+        return
+    fi
+
+    local script_path
+    script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+    # Build PATH that includes common locations and dotnet tools
+    local agent_path="/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.dotnet/tools"
+
+    cat > "$PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$script_path</string>
+        <string>run</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/teams-spotify-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/teams-spotify-sync.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$agent_path</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+EOF
+
+    # Unload if already loaded
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+    echo "LaunchAgent installed and loaded."
+    echo "Logs: ~/Library/Logs/teams-spotify-sync.log"
+}
+
+cmd_uninstall() {
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+
+    if [[ -f "$PLIST_PATH" ]]; then
+        rm "$PLIST_PATH"
+        echo "LaunchAgent removed."
+    else
+        echo "LaunchAgent not installed."
+    fi
+}
+
+cmd_status() {
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+        echo "teams-spotify-sync is running"
+        launchctl print "gui/$(id -u)/$LABEL" 2>&1 | grep -E "state|pid" || true
+    else
+        echo "teams-spotify-sync is not running"
+    fi
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo ""
+        echo "Config: $CONFIG_FILE"
+        cat "$CONFIG_FILE"
+    else
+        echo ""
+        echo "No config file. Run: teams-spotify-sync setup"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Signal handling
+# ---------------------------------------------------------------------------
+
+cleanup() {
+    log "Shutting down..."
+    # Restore volume if we lowered it
+    if [[ "$was_in_meeting" == "true" && -n "$saved_volume" ]]; then
+        if spotify_is_running; then
+            spotify_set_volume "$saved_volume"
+            log "Restored Spotify volume to $saved_volume"
+        fi
+    fi
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+load_config
+
+case "${1:-run}" in
+    run)       cmd_run ;;
+    setup)     cmd_setup ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    status)    cmd_status ;;
+    version)   echo "teams-spotify-sync v$VERSION" ;;
+    help|-h|--help)
+        echo "Usage: teams-spotify-sync <command>"
+        echo ""
+        echo "Commands:"
+        echo "  run        Monitor Teams and adjust Spotify volume (default)"
+        echo "  setup      Interactive configuration"
+        echo "  install    Install LaunchAgent for auto-start"
+        echo "  uninstall  Remove LaunchAgent"
+        echo "  status     Show current status and config"
+        echo "  version    Print version"
+        echo "  help       Show this help"
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Run 'teams-spotify-sync help' for usage."
+        exit 1
+        ;;
+esac
