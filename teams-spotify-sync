@@ -11,10 +11,12 @@ CONFIG_FILE="$CONFIG_DIR/config"
 TEAMS_MONITOR_CMD="teams-monitor"
 MEETING_VOLUME=65
 DEFAULT_VOLUME=100
+DEVICE_RULES=""
 
 # State
 was_in_meeting=false
 saved_volume=""
+HAS_SPOTIFY_CLI=false
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,6 +43,13 @@ check_deps() {
         || die "teams-monitor not found. Install with: dotnet tool install -g svrooij.teams-monitor"
     command -v jq >/dev/null 2>&1 \
         || die "jq not found. Install with: brew install jq"
+
+    # spotify CLI is optional — needed only for device rules
+    if command -v spotify >/dev/null 2>&1; then
+        HAS_SPOTIFY_CLI=true
+    elif [[ -n "$DEVICE_RULES" ]]; then
+        log "WARNING: DEVICE_RULES configured but spotify CLI not found. Falling back to MEETING_VOLUME."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -65,6 +74,63 @@ spotify_set_volume() {
 }
 
 # ---------------------------------------------------------------------------
+# Device detection (requires spotify CLI — optional)
+# ---------------------------------------------------------------------------
+
+spotify_get_device_info() {
+    # Returns "name<TAB>type" of active device, or empty if unavailable
+    spotify status --raw 2>/dev/null \
+        | jq -r '[.device.name // "", .device.type // ""] | @tsv' 2>/dev/null
+}
+
+normalize_device_name() {
+    # Strip Sonos group suffix: "Living Room + 2" → "Living Room"
+    echo "$1" | sed -E 's/ \+ [0-9]+$//'
+}
+
+to_lower() {
+    echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+get_meeting_volume_for_device() {
+    local device_name="$1" device_type="$2"
+    local normalized
+    normalized=$(normalize_device_name "$device_name")
+
+    local lc_name lc_normalized
+    lc_name=$(to_lower "$device_name")
+    lc_normalized=$(to_lower "$normalized")
+
+    IFS=',' read -ra rules <<< "$DEVICE_RULES"
+    for rule in "${rules[@]}"; do
+        # Trim leading/trailing whitespace from the whole rule
+        rule="${rule#"${rule%%[![:space:]]*}"}"
+        rule="${rule%"${rule##*[![:space:]]}"}"
+        [[ -z "$rule" ]] && continue
+
+        local pattern="${rule%%=*}"
+        local volume="${rule#*=}"
+
+        if [[ "$pattern" == type:* ]]; then
+            local type_pattern="${pattern#type:}"
+            if [[ "$(to_lower "$device_type")" == "$(to_lower "$type_pattern")" ]]; then
+                echo "$volume"
+                return 0
+            fi
+        else
+            local lc_pattern
+            lc_pattern=$(to_lower "$pattern")
+            if [[ "$lc_name" == *"$lc_pattern"* ]] || \
+               [[ "$lc_normalized" == *"$lc_pattern"* ]]; then
+                echo "$volume"
+                return 0
+            fi
+        fi
+    done
+    return 1  # no match
+}
+
+# ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 
@@ -83,13 +149,36 @@ process_line() {
         was_in_meeting=true
         log "Meeting started"
 
-        if spotify_is_running && [[ "$(spotify_player_state)" == "playing" ]]; then
-            saved_volume=$(spotify_get_volume)
-            spotify_set_volume "$MEETING_VOLUME"
-            log "Spotify volume: ${saved_volume:-?} -> $MEETING_VOLUME"
-        else
+        if ! spotify_is_running || [[ "$(spotify_player_state)" != "playing" ]]; then
             log "Spotify not playing, no volume change"
+            return 0
         fi
+
+        # Determine target volume
+        local target_vol=""
+        if [[ "$HAS_SPOTIFY_CLI" == "true" && -n "$DEVICE_RULES" ]]; then
+            local device_info device_name device_type
+            device_info=$(spotify_get_device_info) || true
+            if [[ -n "$device_info" ]]; then
+                device_name=$(echo "$device_info" | cut -f1)
+                device_type=$(echo "$device_info" | cut -f2)
+                log "Device: $device_name ($device_type)"
+                target_vol=$(get_meeting_volume_for_device "$device_name" "$device_type") || true
+                if [[ -z "$target_vol" ]]; then
+                    log "Device not in DEVICE_RULES, skipping volume change"
+                    return 0
+                fi
+            else
+                log "Could not detect device, skipping volume change"
+                return 0
+            fi
+        else
+            target_vol="$MEETING_VOLUME"
+        fi
+
+        saved_volume=$(spotify_get_volume)
+        spotify_set_volume "$target_vol"
+        log "Spotify volume: ${saved_volume:-?} -> $target_vol"
 
     elif [[ "$is_in_meeting" == "false" && "$was_in_meeting" == "true" ]]; then
         was_in_meeting=false
@@ -164,6 +253,18 @@ install_deps() {
         fi
     fi
 
+    # spotify CLI (optional — for per-device volume rules)
+    if command -v spotify >/dev/null 2>&1; then
+        echo "  spotify CLI: installed (enables per-device volume rules)"
+    else
+        read -rp "  spotify CLI not found. Install for per-device volume rules? (optional) [y/N]: " answer
+        if [[ "${answer:-N}" =~ ^[Yy]$ ]]; then
+            pip3 install spotify-cli-linux
+        else
+            echo "  Skipping spotify CLI. Per-device rules will not be available."
+        fi
+    fi
+
     echo ""
 }
 
@@ -183,12 +284,69 @@ cmd_setup() {
     read -rp "Default volume when not in meeting (0-100) [$dv]: " input
     DEFAULT_VOLUME="${input:-$dv}"
 
+    # Device rules setup
+    local device_rules=""
+    if command -v spotify >/dev/null 2>&1; then
+        echo ""
+        echo "Detecting Spotify devices..."
+        local devices_json
+        devices_json=$(spotify devices --raw 2>/dev/null) || true
+
+        if [[ -n "$devices_json" ]]; then
+            local device_names
+            device_names=$(echo "$devices_json" | jq -r '.devices[] | "\(.name) (\(.type))"' 2>/dev/null) || true
+
+            if [[ -n "$device_names" ]]; then
+                echo ""
+                echo "Available devices:"
+                local i=1
+                while IFS= read -r dev; do
+                    echo "  $i) $dev"
+                    ((i++))
+                done <<< "$device_names"
+                echo ""
+                echo "Configure per-device meeting volumes (or press Enter to skip)."
+                echo "For each device, enter a volume (0-100) or press Enter to skip it."
+                echo ""
+
+                local rules=()
+                i=1
+                while IFS= read -r dev; do
+                    local name
+                    name=$(echo "$dev" | sed 's/ ([^)]*)//')
+                    read -rp "  $dev -> meeting volume [skip]: " vol
+                    if [[ -n "$vol" ]]; then
+                        rules+=("$name=$vol")
+                    fi
+                    ((i++))
+                done <<< "$device_names"
+
+                if [[ ${#rules[@]} -gt 0 ]]; then
+                    device_rules=$(IFS=','; echo "${rules[*]}")
+                fi
+            fi
+        else
+            echo "  Could not list devices. You can add DEVICE_RULES manually later."
+        fi
+    else
+        echo ""
+        echo "  spotify CLI not available — skipping per-device setup."
+        echo "  Install it later for per-device volume rules."
+    fi
+
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG_FILE" <<EOF
 # teams-spotify-sync configuration
 MEETING_VOLUME=$MEETING_VOLUME
 DEFAULT_VOLUME=$DEFAULT_VOLUME
 # TEAMS_MONITOR_CMD=teams-monitor
+
+# Per-device meeting volumes (optional, requires spotify CLI)
+# Comma-separated rules: "pattern=volume"
+# Match by name (case-insensitive substring) or type with "type:" prefix
+# Sonos groups ("Speaker + 1") automatically match the base name
+# Unmatched devices are left alone. Empty = use MEETING_VOLUME for all.
+DEVICE_RULES="$device_rules"
 EOF
 
     echo ""
