@@ -47,6 +47,8 @@ teams-spotify-sync run        # Run in foreground (for testing)
 teams-spotify-sync setup      # Interactive configuration
 teams-spotify-sync install    # Install LaunchAgent (auto-start on login)
 teams-spotify-sync uninstall  # Remove LaunchAgent
+teams-spotify-sync stop       # Stop the LaunchAgent
+teams-spotify-sync restart    # Restart the LaunchAgent
 teams-spotify-sync status     # Show current status and config
 teams-spotify-sync version    # Print version
 ```

@@ -422,6 +422,25 @@ cmd_uninstall() {
     fi
 }
 
+cmd_stop() {
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+        launchctl bootout "gui/$(id -u)/$LABEL"
+        echo "teams-spotify-sync stopped."
+    else
+        echo "teams-spotify-sync is not running."
+    fi
+}
+
+cmd_restart() {
+    if [[ ! -f "$PLIST_PATH" ]]; then
+        echo "LaunchAgent not installed. Run 'teams-spotify-sync install' first."
+        return 1
+    fi
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+    echo "teams-spotify-sync restarted."
+}
+
 cmd_status() {
     if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
         echo "teams-spotify-sync is running"
@@ -469,6 +488,8 @@ case "${1:-run}" in
     setup)     cmd_setup ;;
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_restart ;;
     status)    cmd_status ;;
     version)   echo "teams-spotify-sync v$VERSION" ;;
     help|-h|--help)
@@ -479,6 +500,8 @@ case "${1:-run}" in
         echo "  setup      Interactive configuration"
         echo "  install    Install LaunchAgent for auto-start"
         echo "  uninstall  Remove LaunchAgent"
+        echo "  stop       Stop the LaunchAgent"
+        echo "  restart    Restart the LaunchAgent"
         echo "  status     Show current status and config"
         echo "  version    Print version"
         echo "  help       Show this help"
