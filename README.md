@@ -36,7 +36,6 @@ teams-spotify-sync setup
 
 This will prompt you for:
 - **Meeting volume** — Spotify volume while in a meeting (default: 65)
-- **Default volume** — fallback restore volume (default: 100)
 - **Per-device rules** — if the `spotify` CLI is installed, configure different volumes per device
 - Whether to install a LaunchAgent so it starts automatically on login
 
@@ -59,12 +58,11 @@ Config file: `~/.config/teams-spotify-sync/config`
 
 ```sh
 MEETING_VOLUME=65      # Volume during meetings (0-100)
-DEFAULT_VOLUME=100     # Fallback restore volume
 DEVICE_RULES=""        # Per-device rules (see below)
 # TEAMS_MONITOR_CMD=teams-monitor
 ```
 
-Your actual pre-meeting volume is saved and restored automatically — `DEFAULT_VOLUME` is only used as a fallback if the pre-meeting volume couldn't be captured.
+Your actual pre-meeting volume is saved when it's lowered and restored when you leave. Devices we don't lower (Spotify not playing, no matching rule, or a `skip` rule) are left untouched on both join and leave — they are never forced to a fixed level.
 
 ### Device rules
 
@@ -86,6 +84,12 @@ DEVICE_RULES="type:Speaker=20,type:Computer=50"
 
 ```sh
 DEVICE_RULES="FortiBook Pro=40,type:Speaker=20,type:Computer=65"
+```
+
+**Skip a device** — use `skip` (or `none`/`off`/`-`) as the volume to explicitly leave a device unchanged during meetings. Useful for speakers you never want adjusted:
+
+```sh
+DEVICE_RULES="type:Speaker=skip,type:Computer=50"
 ```
 
 **Sonos grouping** — Sonos groups appear as "Speaker + 1", "Speaker + 2", etc. The suffix is stripped before matching, so a rule for "Speaker" matches all groups.

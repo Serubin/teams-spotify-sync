@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.2"
 LABEL="net.serubin.teams-spotify-sync"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/teams-spotify-sync"
@@ -10,7 +10,6 @@ CONFIG_FILE="$CONFIG_DIR/config"
 # Defaults
 TEAMS_MONITOR_CMD="teams-monitor"
 MEETING_VOLUME=65
-DEFAULT_VOLUME=100
 DEVICE_RULES=""
 
 # State
@@ -176,6 +175,18 @@ process_line() {
             target_vol="$MEETING_VOLUME"
         fi
 
+        # Honor explicit "skip" rules and reject bad values, leaving the device alone.
+        case "$(to_lower "$target_vol")" in
+            skip|none|off|-)
+                log "DEVICE_RULES says skip for this device, leaving volume unchanged"
+                return 0
+                ;;
+        esac
+        if ! [[ "$target_vol" =~ ^[0-9]+$ ]] || (( target_vol < 0 || target_vol > 100 )); then
+            log "Invalid target volume '$target_vol', leaving volume unchanged"
+            return 0
+        fi
+
         saved_volume=$(spotify_get_volume)
         spotify_set_volume "$target_vol"
         log "Spotify volume: ${saved_volume:-?} -> $target_vol"
@@ -184,10 +195,17 @@ process_line() {
         was_in_meeting=false
         log "Meeting ended"
 
-        local restore_vol="${saved_volume:-$DEFAULT_VOLUME}"
-        if spotify_is_running; then
-            spotify_set_volume "$restore_vol"
-            log "Spotify volume restored to $restore_vol"
+        # Only restore if we actually lowered the volume at meeting start.
+        # Empty saved_volume = we deliberately left this device alone (Spotify not
+        # playing, no matching DEVICE_RULE, or a skip rule). Forcing a volume here is
+        # what blasted Sonos to 100%.
+        if [[ -n "$saved_volume" ]]; then
+            if spotify_is_running; then
+                spotify_set_volume "$saved_volume"
+                log "Spotify volume restored to $saved_volume"
+            fi
+        else
+            log "No saved volume — leaving device unchanged"
         fi
         saved_volume=""
     fi
@@ -195,7 +213,7 @@ process_line() {
 
 cmd_run() {
     check_deps
-    log "teams-spotify-sync v$VERSION starting (meeting_vol=$MEETING_VOLUME, default_vol=$DEFAULT_VOLUME)"
+    log "teams-spotify-sync v$VERSION starting (meeting_vol=$MEETING_VOLUME)"
 
     local backoff=5
     while true; do
@@ -276,13 +294,9 @@ cmd_setup() {
     install_deps
 
     local mv="$MEETING_VOLUME"
-    local dv="$DEFAULT_VOLUME"
 
     read -rp "Volume during meetings (0-100) [$mv]: " input
     MEETING_VOLUME="${input:-$mv}"
-
-    read -rp "Default volume when not in meeting (0-100) [$dv]: " input
-    DEFAULT_VOLUME="${input:-$dv}"
 
     # Device rules setup
     local device_rules=""
@@ -338,12 +352,12 @@ cmd_setup() {
     cat > "$CONFIG_FILE" <<EOF
 # teams-spotify-sync configuration
 MEETING_VOLUME=$MEETING_VOLUME
-DEFAULT_VOLUME=$DEFAULT_VOLUME
 # TEAMS_MONITOR_CMD=teams-monitor
 
 # Per-device meeting volumes (optional, requires spotify CLI)
 # Comma-separated rules: "pattern=volume"
 # Match by name (case-insensitive substring) or type with "type:" prefix
+# Use "skip" (or none/off/-) as the volume to explicitly leave a device unchanged
 # Sonos groups ("Speaker + 1") automatically match the base name
 # Unmatched devices are left alone. Empty = use MEETING_VOLUME for all.
 DEVICE_RULES="$device_rules"
