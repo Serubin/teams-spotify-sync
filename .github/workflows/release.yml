@@ -1,0 +1,106 @@
+name: release
+
+# A tag push cuts the GitHub release and bumps the formula in
+# Serubin/homebrew-formula. The script is the whole product — there is nothing
+# to compile — so this checksums GitHub's source tarball and rewrites the
+# formula in place.
+
+on:
+  push:
+    tags: ['v*']
+
+# One release at a time: two concurrent runs would race on the tap push. Never
+# cancelled — an interrupted run may already have published.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Inert on forks, which must not publish to this tap.
+    if: github.repository == 'Serubin/teams-spotify-sync'
+    runs-on: ubuntu-latest
+    steps:
+      # Fail before anything is published: a missing secret discovered at the
+      # push step would leave a release behind with a stale formula pointing at
+      # the previous one.
+      - name: Require tap token
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "${TAP_GITHUB_TOKEN}" ]; then
+            echo "::error::TAP_GITHUB_TOKEN is unset. Create a fine-grained PAT with contents:write on Serubin/homebrew-formula and run: gh secret set TAP_GITHUB_TOKEN --repo Serubin/teams-spotify-sync"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      # The formula's test asserts the script prints the version its tarball URL
+      # implies. Catch the mismatch here rather than in someone's `brew test`.
+      - name: Check VERSION matches the tag
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          script="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' teams-spotify-sync)"
+          if [ "$tag" != "$script" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME carries VERSION=\"$script\". Bump VERSION, delete the tag, and re-tag."
+            exit 1
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A re-run of the same tag must reach the bump step, which is itself a
+          # no-op when the formula is already current.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes
+          fi
+
+      - name: Checksum the tarball
+        id: tarball
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          # Generated on demand; can 404 briefly right after the tag lands.
+          # --remove-on-error, or a failed attempt leaves an empty file behind
+          # and the tap is handed the checksum of nothing.
+          for _ in $(seq 1 10); do
+            curl -fsSL --remove-on-error -o tarball.tar.gz "$url" && ok=1 && break
+            sleep 3
+          done
+          if [ "${ok:-}" != 1 ]; then
+            echo "::error::$url did not become available"
+            exit 1
+          fi
+          echo "sha256=$(sha256sum tarball.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Bump the formula
+        env:
+          SHA256: ${{ steps.tarball.outputs.sha256 }}
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/Serubin/homebrew-formula.git" tap
+          cd tap
+          f=Formula/teams-spotify-sync.rb
+          sed -i \
+            -e "s|^  url \".*\"$|  url \"https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz\"|" \
+            -e "s|^  sha256 \".*\"$|  sha256 \"${SHA256}\"|" \
+            "$f"
+          # A re-run of the same tag is a no-op, not an empty commit.
+          if git diff --quiet "$f"; then
+            echo "formula already current"
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "teams-spotify-sync ${GITHUB_REF_NAME#v}" "$f"
+          git push
